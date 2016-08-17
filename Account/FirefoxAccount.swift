@@ -198,7 +198,7 @@ public class FirefoxAccount {
         log.debug("no advance() in progress; setting and returning new shared deferred.")
         OSSpinLockUnlock(&advanceLock)
 
-        deferred.upon { _ in
+        deferred.upon { state in
             // This advance() is complete.  Clear the shared deferred.
             OSSpinLockLock(&self.advanceLock)
             if let existingDeferred = self.advanceDeferred where existingDeferred === deferred {
@@ -209,6 +209,11 @@ public class FirefoxAccount {
                 log.warning("advance() completed but shared deferred is not existing deferred; ignoring potential bug!")
             }
             OSSpinLockUnlock(&self.advanceLock)
+
+            // If we're married, make sure the device is registered.
+            if let marriedState = state as? MarriedState {
+                self.registerOrUpdateDevice(client, state: marriedState)
+            }
         }
         return deferred
     }
@@ -246,25 +251,92 @@ public class FirefoxAccount {
         return false
     }
 
-    public func registerOrUpdateDevice(state: MarriedState) -> Deferred<Maybe<String>> {
+    private func registerOrUpdateDevice(client: FxAClient10, state: MarriedState) -> Deferred<Maybe<String>> {
         let sessionToken = state.sessionToken
-        let result: Deferred<Maybe<FxADeviceRegistrationResponse>>
-        let client = FxAClient10()
         let name = DeviceInfo.defaultClientName()
-        if let deviceId = fxaDeviceId { // Create device
-            result = client.updateDevice(self, sessionToken: sessionToken, id: deviceId, name: name)
-        } else { // Update device
-            result = client.registerDevice(self, sessionToken: sessionToken, name: name, type: "mobile")
+        let device: FxADevice
+        if let deviceId = fxaDeviceId {
+            device = FxADevice.forUpdate(name, id: deviceId)
+        } else {
+            device = FxADevice.forRegister(name, type: "mobile")
         }
 
-        return result.map { result in
-            if let device = result.successValue {
-                self.fxaDeviceId = device.id
+        return client.registerOrUpdateDevice(sessionToken, device: device).bind { result in
+            let deferred = Deferred<Maybe<String>>()
+
+            if let device = result.successValue,
+               let deviceId = device.id {
+                self.fxaDeviceId = deviceId
                 self.deviceRegistrationVersion = DEVICE_REGISTRATION_VERSION
-                return Maybe(success: device.id)
+                deferred.fill(Maybe(success: deviceId))
+                return deferred
+            }
+
+            let error = result.failureValue as? FxAClientError
+            switch (error) {
+            case let .Remote(remoteError)?:
+                switch (remoteError.code) {
+                case FxAccountRemoteError.DEVICE_SESSION_CONFLICT:
+                    self.recoverFromDeviceSessionConflict(client, deferred: deferred, sessionToken: sessionToken)
+                case FxAccountRemoteError.UNKNOWN_DEVICE:
+                    // TODO: Shouldn't this also clear registration version? Android doesn't.
+                    self.handleUnknownDevice()
+                case FxAccountRemoteError.INVALID_AUTHENTICATION_TOKEN:
+                    self.logErrorAndResetDeviceRegistrationVersion(String(remoteError))
+                    self.handleTokenError(client)
+                default:
+                    self.logErrorAndResetDeviceRegistrationVersion(String(remoteError))
+                }
+            case let .Local(localError)?:
+                self.logErrorAndResetDeviceRegistrationVersion(localError.description)
+            default:
+                // This shouldn't happen.
+                self.logErrorAndResetDeviceRegistrationVersion("invalid error type")
+                assertionFailure()
+            }
+
+            deferred.fillIfUnfilled(Maybe(failure: AccountError.DeviceRegistrationFailed))
+
+            return deferred
+        }
+    }
+
+    private func handleUnknownDevice() {
+        log.info("unknown device id, clearing the cached device id")
+        fxaDeviceId = nil
+    }
+
+    private func recoverFromDeviceSessionConflict(client: FxAClient10, deferred: Deferred<Maybe<String>>, sessionToken: NSData) {
+        log.warning("device session conflict, attempting to ascertain the correct device id")
+        client.devices(sessionToken).upon { response in
+            if let success = response.successValue,
+               let currentDevice = success.devices.find({ $0.isCurrentDevice }) {
+                deferred.fill(Maybe(success: currentDevice.id))
             } else {
-                return Maybe(failure: AccountError.DeviceRegistrationFailed)
+                self.logErrorAndResetDeviceRegistrationVersion("conflict recovery failed: \(response.failureValue?.description ?? "")")
+                deferred.fill(Maybe(failure: AccountError.DeviceRegistrationFailed))
             }
         }
+    }
+
+    private func handleTokenError(client: FxAClient10) {
+        client.status(uid).upon() { result in
+            if let status = result.successValue {
+                if !status.exists {
+                    log.info("token was invalidated because the account no longer exists")
+                    // TODO: Should be in a "I have an Android account, but the FxA is gone." State.
+                    // This will do for now..
+                    self.makeDoghouse()
+                } else {
+                    log.error("the session token was invalid")
+                    self.makeDoghouse()
+                }
+            }
+        }
+    }
+
+    private func logErrorAndResetDeviceRegistrationVersion(description: String) {
+        log.error("device registration failed: \(description)")
+        deviceRegistrationVersion = 0
     }
 }

@@ -77,10 +77,6 @@ class FxALoginStateMachine {
             }
             log.info("Key pair and certificate are fresh; staying Married.")
 
-            if let account = account where account.fxaDeviceId == nil || account.deviceRegistrationVersion == 0 {
-                account.registerOrUpdateDevice(state)
-            }
-
             return same
 
         case .CohabitingBeforeKeyPair:
